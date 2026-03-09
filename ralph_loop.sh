@@ -34,6 +34,13 @@ CALL_COUNT_FILE="$RALPH_DIR/.call_count"
 TIMESTAMP_FILE="$RALPH_DIR/.last_reset"
 USE_TMUX=false
 
+# Plan queue mode configuration
+PLAN_DIR=""                          # Directory containing plan files (--plan-dir)
+PLAN_QUEUE=()                        # Ordered list of plan file paths
+PLAN_QUEUE_INDEX=0                   # Current plan index
+CURRENT_PLAN_FILE=""                 # Currently executing plan file
+PLAN_QUEUE_STATUS_FILE="$RALPH_DIR/.plan_queue_status.json"
+
 # Save environment variable state BEFORE setting defaults
 # These are used by load_ralphrc() to determine which values came from environment
 _env_MAX_CALLS_PER_HOUR="${MAX_CALLS_PER_HOUR:-}"
@@ -306,6 +313,10 @@ setup_tmux_session() {
     # Forward --output-format if non-default (default is json)
     if [[ "$CLAUDE_OUTPUT_FORMAT" != "json" ]]; then
         ralph_cmd="$ralph_cmd --output-format $CLAUDE_OUTPUT_FORMAT"
+    fi
+    # Forward --plan-dir if set
+    if [[ -n "$PLAN_DIR" ]]; then
+        ralph_cmd="$ralph_cmd --plan-dir '$PLAN_DIR'"
     fi
     # Forward --verbose if enabled
     if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
@@ -703,6 +714,134 @@ build_loop_context() {
 
     # Limit total length to ~500 chars
     echo "${context:0:500}"
+}
+
+# ============================================================================
+# Plan Queue Mode Functions
+# ============================================================================
+
+# Discover plan files in a directory, sorted lexicographically
+# Populates PLAN_QUEUE array
+discover_plan_files() {
+    local plan_dir="$1"
+    PLAN_QUEUE=()
+
+    if [[ ! -d "$plan_dir" ]]; then
+        log_status "ERROR" "Plan directory not found: $plan_dir"
+        return 1
+    fi
+
+    # Find all *-PLAN.md files, sort lexicographically by path
+    while IFS= read -r -d '' plan_file; do
+        PLAN_QUEUE+=("$plan_file")
+    done < <(find "$plan_dir" -name "*-PLAN.md" -type f -print0 | sort -z)
+
+    if [[ ${#PLAN_QUEUE[@]} -eq 0 ]]; then
+        log_status "ERROR" "No *-PLAN.md files found in: $plan_dir"
+        return 1
+    fi
+
+    log_status "INFO" "Discovered ${#PLAN_QUEUE[@]} plan files:"
+    for i in "${!PLAN_QUEUE[@]}"; do
+        local plan_file="${PLAN_QUEUE[$i]}"
+        local summary_file
+        summary_file=$(plan_to_summary_path "$plan_file")
+        if [[ -f "$summary_file" ]]; then
+            log_status "INFO" "  [$((i+1))] ${plan_file} [DONE]"
+        else
+            log_status "INFO" "  [$((i+1))] ${plan_file}"
+        fi
+    done
+
+    return 0
+}
+
+# Convert a plan file path to its expected summary file path
+# e.g., .planning/phases/01-preview-api/01-01-PLAN.md -> .planning/phases/01-preview-api/01-01-SUMMARY.md
+plan_to_summary_path() {
+    local plan_file="$1"
+    echo "${plan_file//-PLAN.md/-SUMMARY.md}"
+}
+
+# Check if a plan has already been completed (SUMMARY.md exists)
+is_plan_completed() {
+    local plan_file="$1"
+    local summary_file
+    summary_file=$(plan_to_summary_path "$plan_file")
+    [[ -f "$summary_file" ]]
+}
+
+# Find the next incomplete plan in the queue
+# Sets PLAN_QUEUE_INDEX and returns 0 if found, 1 if all done
+find_next_plan() {
+    local i
+    for i in "${!PLAN_QUEUE[@]}"; do
+        if ! is_plan_completed "${PLAN_QUEUE[$i]}"; then
+            PLAN_QUEUE_INDEX=$i
+            CURRENT_PLAN_FILE="${PLAN_QUEUE[$i]}"
+            return 0
+        fi
+    done
+    return 1  # All plans completed
+}
+
+# Count completed and total plans
+get_plan_progress() {
+    local completed=0
+    local total=${#PLAN_QUEUE[@]}
+    for plan_file in "${PLAN_QUEUE[@]}"; do
+        if is_plan_completed "$plan_file"; then
+            ((completed++))
+        fi
+    done
+    echo "$completed/$total"
+}
+
+# Update plan queue status file (for monitor display)
+update_plan_queue_status() {
+    local current_plan="${1:-}"
+    local status="${2:-running}"
+    local completed=0
+    local total=${#PLAN_QUEUE[@]}
+
+    for plan_file in "${PLAN_QUEUE[@]}"; do
+        if is_plan_completed "$plan_file"; then
+            ((completed++))
+        fi
+    done
+
+    # Build JSON queue array
+    local queue_json="["
+    local first=true
+    for i in "${!PLAN_QUEUE[@]}"; do
+        local plan_file="${PLAN_QUEUE[$i]}"
+        local plan_status="pending"
+        if is_plan_completed "$plan_file"; then
+            plan_status="completed"
+        elif [[ "$plan_file" == "$current_plan" ]]; then
+            plan_status="in_progress"
+        fi
+
+        if [[ "$first" != "true" ]]; then
+            queue_json+=","
+        fi
+        first=false
+        queue_json+="{\"file\":\"$plan_file\",\"status\":\"$plan_status\"}"
+    done
+    queue_json+="]"
+
+    mkdir -p "$(dirname "$PLAN_QUEUE_STATUS_FILE")"
+    cat > "$PLAN_QUEUE_STATUS_FILE" << QEOF
+{
+  "mode": "plan_queue",
+  "status": "$status",
+  "current_plan": "$current_plan",
+  "completed": $completed,
+  "total": $total,
+  "progress": "$completed/$total",
+  "queue": $queue_json
+}
+QEOF
 }
 
 # Get session file age in hours (cross-platform)
@@ -1530,6 +1669,165 @@ trap cleanup SIGINT SIGTERM
 # Global variable for loop count (needed by cleanup function)
 loop_count=0
 
+# Run the inner loop for a single prompt file until completion/exit
+# This is the core Ralph loop extracted so it can be called per-plan or standalone
+run_single_prompt_loop() {
+    local prompt_file="$1"
+    local plan_label="${2:-}"  # Optional label for logging (e.g., "Plan 2/6: 01-01-PLAN.md")
+
+    while true; do
+        loop_count=$((loop_count + 1))
+
+        # Update session last_used timestamp
+        update_session_last_used
+
+        log_status "INFO" "Loop #$loop_count - calling init_call_tracking..."
+        init_call_tracking
+
+        if [[ -n "$plan_label" ]]; then
+            log_status "LOOP" "=== Starting Loop #$loop_count ($plan_label) ==="
+        else
+            log_status "LOOP" "=== Starting Loop #$loop_count ==="
+        fi
+
+        # In plan-dir mode, skip integrity check (no .ralph/ required)
+        if [[ -z "$PLAN_DIR" ]]; then
+            # Verify Ralph's critical files still exist (Issue #149)
+            if ! validate_ralph_integrity; then
+                mkdir -p "$LOG_DIR" 2>/dev/null || true
+                log_status "ERROR" "Ralph integrity check failed - critical files missing"
+                echo ""
+                echo "$(get_integrity_report)"
+                echo ""
+                reset_session "integrity_failure"
+                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" "integrity_failure" "halted" "files_deleted"
+                return 1
+            fi
+        fi
+
+        # Check circuit breaker before attempting execution
+        if should_halt_execution; then
+            reset_session "circuit_breaker_open"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected"
+            log_status "ERROR" "🛑 Circuit breaker has opened - execution halted"
+            return 3
+        fi
+
+        # Check rate limits
+        if ! can_make_call; then
+            wait_for_reset
+            continue
+        fi
+
+        # Check for graceful exit conditions
+        local exit_reason=$(should_exit_gracefully)
+        if [[ "$exit_reason" != "" ]]; then
+            # Handle permission_denied specially (Issue #101)
+            if [[ "$exit_reason" == "permission_denied" ]]; then
+                log_status "ERROR" "🚫 Permission denied - halting loop"
+                reset_session "permission_denied"
+                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "permission_denied" "halted" "permission_denied"
+
+                echo ""
+                echo -e "${RED}╔════════════════════════════════════════════════════════════╗${NC}"
+                echo -e "${RED}║  PERMISSION DENIED - Loop Halted                          ║${NC}"
+                echo -e "${RED}╚════════════════════════════════════════════════════════════╝${NC}"
+                echo ""
+                echo -e "${YELLOW}Claude Code was denied permission to execute commands.${NC}"
+                echo ""
+                echo -e "${YELLOW}To fix this:${NC}"
+                echo "  1. Edit .ralphrc and update ALLOWED_TOOLS to include the required tools"
+                echo "  2. Common patterns:"
+                echo "     - Bash(npm *)     - All npm commands"
+                echo "     - Bash(npm install) - Only npm install"
+                echo "     - Bash(pnpm *)    - All pnpm commands"
+                echo "     - Bash(yarn *)    - All yarn commands"
+                echo ""
+                echo -e "${YELLOW}After updating .ralphrc:${NC}"
+                echo "  ralph --reset-session  # Clear stale session state"
+                echo "  ralph --monitor        # Restart the loop"
+                echo ""
+
+                if [[ -f ".ralphrc" ]]; then
+                    local current_tools=$(grep "^ALLOWED_TOOLS=" ".ralphrc" 2>/dev/null | cut -d= -f2- | tr -d '"')
+                    if [[ -n "$current_tools" ]]; then
+                        echo -e "${BLUE}Current ALLOWED_TOOLS:${NC} $current_tools"
+                        echo ""
+                    fi
+                fi
+
+                return 1
+            fi
+
+            log_status "SUCCESS" "🏁 Graceful exit triggered: $exit_reason"
+            reset_session "plan_complete"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "graceful_exit" "completed" "$exit_reason"
+
+            log_status "SUCCESS" "🎉 Plan completed! Loops: $loop_count, API calls: $(cat "$CALL_COUNT_FILE"), Reason: $exit_reason"
+
+            return 0  # Success - plan completed
+        fi
+
+        # Update status
+        local calls_made=$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")
+        update_status "$loop_count" "$calls_made" "executing" "running"
+
+        # Execute Claude Code with the specified prompt file
+        PROMPT_FILE="$prompt_file"
+        execute_claude_code "$loop_count"
+        local exec_result=$?
+
+        if [ $exec_result -eq 0 ]; then
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success"
+            sleep 5
+        elif [ $exec_result -eq 3 ]; then
+            reset_session "circuit_breaker_trip"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected"
+            log_status "ERROR" "🛑 Circuit breaker has opened - halting loop"
+            log_status "INFO" "Run 'ralph --reset-circuit' to reset the circuit breaker after addressing issues"
+            return 3
+        elif [ $exec_result -eq 2 ]; then
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused"
+            log_status "WARN" "🛑 Claude API 5-hour limit reached!"
+
+            echo -e "\n${YELLOW}The Claude API 5-hour usage limit has been reached.${NC}"
+            echo -e "${YELLOW}You can either:${NC}"
+            echo -e "  ${GREEN}1)${NC} Wait for the limit to reset (usually within an hour)"
+            echo -e "  ${GREEN}2)${NC} Exit the loop and try again later"
+            echo -e "\n${BLUE}Choose an option (1 or 2):${NC} "
+
+            read -t 30 -n 1 user_choice || true
+            echo
+
+            if [[ "$user_choice" == "2" ]]; then
+                log_status "INFO" "User chose to exit. Exiting loop..."
+                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit_exit" "stopped" "api_5hour_limit"
+                return 2
+            else
+                log_status "INFO" "Waiting for API limit reset (auto-wait for unattended mode)..."
+                local wait_minutes=60
+                log_status "INFO" "Waiting $wait_minutes minutes before retrying..."
+
+                local wait_seconds=$((wait_minutes * 60))
+                while [[ $wait_seconds -gt 0 ]]; do
+                    local minutes=$((wait_seconds / 60))
+                    local seconds=$((wait_seconds % 60))
+                    printf "\r${YELLOW}Time until retry: %02d:%02d${NC}" $minutes $seconds
+                    sleep 1
+                    ((wait_seconds--))
+                done
+                printf "\n"
+            fi
+        else
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error"
+            log_status "WARN" "Execution failed, waiting 30 seconds before retry..."
+            sleep 30
+        fi
+
+        log_status "LOOP" "=== Completed Loop #$loop_count ==="
+    done
+}
+
 # Main loop
 main() {
     # Load project-specific configuration from .ralphrc
@@ -1547,6 +1845,99 @@ main() {
 
     log_status "SUCCESS" "🚀 Ralph loop starting with Claude Code"
     log_status "INFO" "Max calls per hour: $MAX_CALLS_PER_HOUR"
+
+    # ========================================================================
+    # Plan Queue Mode: execute plans sequentially from a directory
+    # ========================================================================
+    if [[ -n "$PLAN_DIR" ]]; then
+        log_status "INFO" "Plan queue mode: $PLAN_DIR"
+
+        # Create .ralph dir for logs/status even if not a Ralph project
+        mkdir -p "$RALPH_DIR/logs" "$DOCS_DIR" 2>/dev/null || true
+
+        # Discover plan files
+        if ! discover_plan_files "$PLAN_DIR"; then
+            exit 1
+        fi
+
+        # Find first incomplete plan
+        if ! find_next_plan; then
+            log_status "SUCCESS" "🎉 All ${#PLAN_QUEUE[@]} plans already completed!"
+            update_plan_queue_status "" "all_complete"
+            exit 0
+        fi
+
+        local total_plans=${#PLAN_QUEUE[@]}
+        log_status "INFO" "Starting from plan $((PLAN_QUEUE_INDEX + 1))/$total_plans: $(basename "$CURRENT_PLAN_FILE")"
+
+        # Initialize session tracking
+        init_session_tracking
+
+        # Iterate through plans
+        while true; do
+            local plan_num=$((PLAN_QUEUE_INDEX + 1))
+            local plan_basename
+            plan_basename=$(basename "$CURRENT_PLAN_FILE")
+            local plan_label="Plan $plan_num/$total_plans: $plan_basename"
+
+            log_status "LOOP" "╔════════════════════════════════════════════════════════════╗"
+            log_status "LOOP" "║  $plan_label"
+            log_status "LOOP" "║  Progress: $(get_plan_progress)"
+            log_status "LOOP" "╚════════════════════════════════════════════════════════════╝"
+
+            # Update plan queue status for monitor
+            update_plan_queue_status "$CURRENT_PLAN_FILE" "running"
+
+            # Reset circuit breaker and session between plans for a clean start
+            if command -v reset_circuit_breaker &>/dev/null; then
+                reset_circuit_breaker "New plan starting" 2>/dev/null || true
+            fi
+            # Clear exit signals from previous plan
+            rm -f "$EXIT_SIGNALS_FILE" "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || true
+
+            # Run the loop for this plan
+            run_single_prompt_loop "$CURRENT_PLAN_FILE" "$plan_label"
+            local plan_result=$?
+
+            if [[ $plan_result -eq 0 ]]; then
+                # Plan completed successfully
+                log_status "SUCCESS" "✅ Completed: $plan_basename"
+                update_plan_queue_status "$CURRENT_PLAN_FILE" "plan_completed"
+
+                # Find next incomplete plan
+                if ! find_next_plan; then
+                    log_status "SUCCESS" "🎉 All $total_plans plans completed!"
+                    update_plan_queue_status "" "all_complete"
+
+                    log_status "SUCCESS" "Final stats:"
+                    log_status "INFO" "  - Total plans: $total_plans"
+                    log_status "INFO" "  - Total loops: $loop_count"
+                    log_status "INFO" "  - API calls used: $(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)"
+                    break
+                fi
+
+                log_status "INFO" "Moving to next plan: $(basename "$CURRENT_PLAN_FILE")"
+                sleep 3  # Brief pause between plans
+            elif [[ $plan_result -eq 2 ]]; then
+                # API limit - user chose to exit
+                update_plan_queue_status "$CURRENT_PLAN_FILE" "api_limit"
+                log_status "WARN" "Stopped at $plan_basename due to API limit"
+                break
+            else
+                # Error or circuit breaker
+                update_plan_queue_status "$CURRENT_PLAN_FILE" "error"
+                log_status "ERROR" "Failed on $plan_basename (exit code: $plan_result)"
+                log_status "INFO" "Resume with: ralph --plan-dir $PLAN_DIR"
+                break
+            fi
+        done
+
+        return
+    fi
+
+    # ========================================================================
+    # Standard Mode: single PROMPT.md execution
+    # ========================================================================
     log_status "INFO" "Logs: $LOG_DIR/ | Docs: $DOCS_DIR/ | Status: $STATUS_FILE"
 
     # Check if project uses old flat structure and needs migration
@@ -1567,7 +1958,7 @@ main() {
     if [[ ! -f "$PROMPT_FILE" ]]; then
         log_status "ERROR" "Prompt file '$PROMPT_FILE' not found!"
         echo ""
-        
+
         # Check if this looks like a partial Ralph project
         if [[ -f "$RALPH_DIR/fix_plan.md" ]] || [[ -d "$RALPH_DIR/specs" ]] || [[ -f "$RALPH_DIR/AGENT.md" ]]; then
             echo "This appears to be a Ralph project but is missing .ralph/PROMPT.md."
@@ -1602,164 +1993,8 @@ main() {
 
     log_status "INFO" "Starting main loop..."
 
-    while true; do
-        loop_count=$((loop_count + 1))
-
-        # Update session last_used timestamp
-        update_session_last_used
-
-        log_status "INFO" "Loop #$loop_count - calling init_call_tracking..."
-        init_call_tracking
-        
-        log_status "LOOP" "=== Starting Loop #$loop_count ==="
-        
-        # Verify Ralph's critical files still exist (Issue #149)
-        if ! validate_ralph_integrity; then
-            # Ensure log directory exists for logging even if .ralph/ was deleted
-            mkdir -p "$LOG_DIR" 2>/dev/null || true
-            log_status "ERROR" "Ralph integrity check failed - critical files missing"
-            echo ""
-            echo "$(get_integrity_report)"
-            echo ""
-            reset_session "integrity_failure"
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" "integrity_failure" "halted" "files_deleted"
-            break
-        fi
-
-        # Check circuit breaker before attempting execution
-        if should_halt_execution; then
-            reset_session "circuit_breaker_open"
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected"
-            log_status "ERROR" "🛑 Circuit breaker has opened - execution halted"
-            break
-        fi
-
-        # Check rate limits
-        if ! can_make_call; then
-            wait_for_reset
-            continue
-        fi
-
-        # Check for graceful exit conditions
-        local exit_reason=$(should_exit_gracefully)
-        if [[ "$exit_reason" != "" ]]; then
-            # Handle permission_denied specially (Issue #101)
-            if [[ "$exit_reason" == "permission_denied" ]]; then
-                log_status "ERROR" "🚫 Permission denied - halting loop"
-                reset_session "permission_denied"
-                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "permission_denied" "halted" "permission_denied"
-
-                # Display helpful guidance for resolving permission issues
-                echo ""
-                echo -e "${RED}╔════════════════════════════════════════════════════════════╗${NC}"
-                echo -e "${RED}║  PERMISSION DENIED - Loop Halted                          ║${NC}"
-                echo -e "${RED}╚════════════════════════════════════════════════════════════╝${NC}"
-                echo ""
-                echo -e "${YELLOW}Claude Code was denied permission to execute commands.${NC}"
-                echo ""
-                echo -e "${YELLOW}To fix this:${NC}"
-                echo "  1. Edit .ralphrc and update ALLOWED_TOOLS to include the required tools"
-                echo "  2. Common patterns:"
-                echo "     - Bash(npm *)     - All npm commands"
-                echo "     - Bash(npm install) - Only npm install"
-                echo "     - Bash(pnpm *)    - All pnpm commands"
-                echo "     - Bash(yarn *)    - All yarn commands"
-                echo ""
-                echo -e "${YELLOW}After updating .ralphrc:${NC}"
-                echo "  ralph --reset-session  # Clear stale session state"
-                echo "  ralph --monitor        # Restart the loop"
-                echo ""
-
-                # Show current ALLOWED_TOOLS if .ralphrc exists
-                if [[ -f ".ralphrc" ]]; then
-                    local current_tools=$(grep "^ALLOWED_TOOLS=" ".ralphrc" 2>/dev/null | cut -d= -f2- | tr -d '"')
-                    if [[ -n "$current_tools" ]]; then
-                        echo -e "${BLUE}Current ALLOWED_TOOLS:${NC} $current_tools"
-                        echo ""
-                    fi
-                fi
-
-                break
-            fi
-
-            log_status "SUCCESS" "🏁 Graceful exit triggered: $exit_reason"
-            reset_session "project_complete"
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "graceful_exit" "completed" "$exit_reason"
-
-            log_status "SUCCESS" "🎉 Ralph has completed the project! Final stats:"
-            log_status "INFO" "  - Total loops: $loop_count"
-            log_status "INFO" "  - API calls used: $(cat "$CALL_COUNT_FILE")"
-            log_status "INFO" "  - Exit reason: $exit_reason"
-
-            break
-        fi
-        
-        # Update status
-        local calls_made=$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")
-        update_status "$loop_count" "$calls_made" "executing" "running"
-        
-        # Execute Claude Code
-        execute_claude_code "$loop_count"
-        local exec_result=$?
-        
-        if [ $exec_result -eq 0 ]; then
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success"
-
-            # Brief pause between successful executions
-            sleep 5
-        elif [ $exec_result -eq 3 ]; then
-            # Circuit breaker opened
-            reset_session "circuit_breaker_trip"
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected"
-            log_status "ERROR" "🛑 Circuit breaker has opened - halting loop"
-            log_status "INFO" "Run 'ralph --reset-circuit' to reset the circuit breaker after addressing issues"
-            break
-        elif [ $exec_result -eq 2 ]; then
-            # API 5-hour limit reached - handle specially
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused"
-            log_status "WARN" "🛑 Claude API 5-hour limit reached!"
-            
-            # Ask user whether to wait or exit
-            echo -e "\n${YELLOW}The Claude API 5-hour usage limit has been reached.${NC}"
-            echo -e "${YELLOW}You can either:${NC}"
-            echo -e "  ${GREEN}1)${NC} Wait for the limit to reset (usually within an hour)"
-            echo -e "  ${GREEN}2)${NC} Exit the loop and try again later"
-            echo -e "\n${BLUE}Choose an option (1 or 2):${NC} "
-            
-            # Read user input with timeout
-            read -t 30 -n 1 user_choice || true
-            echo  # New line after input
-            
-            if [[ "$user_choice" == "2" ]]; then
-                log_status "INFO" "User chose to exit. Exiting loop..."
-                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit_exit" "stopped" "api_5hour_limit"
-                break
-            else
-                # Auto-wait on timeout (empty choice) or explicit "1" — supports unattended operation
-                log_status "INFO" "Waiting for API limit reset (auto-wait for unattended mode)..."
-                # Wait for longer period when API limit is hit
-                local wait_minutes=60
-                log_status "INFO" "Waiting $wait_minutes minutes before retrying..."
-                
-                # Countdown display
-                local wait_seconds=$((wait_minutes * 60))
-                while [[ $wait_seconds -gt 0 ]]; do
-                    local minutes=$((wait_seconds / 60))
-                    local seconds=$((wait_seconds % 60))
-                    printf "\r${YELLOW}Time until retry: %02d:%02d${NC}" $minutes $seconds
-                    sleep 1
-                    ((wait_seconds--))
-                done
-                printf "\n"
-            fi
-        else
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error"
-            log_status "WARN" "Execution failed, waiting 30 seconds before retry..."
-            sleep 30
-        fi
-        
-        log_status "LOOP" "=== Completed Loop #$loop_count ==="
-    done
+    # Run the standard single-prompt loop
+    run_single_prompt_loop "$PROMPT_FILE"
 }
 
 # Help function
@@ -1792,6 +2027,12 @@ Modern CLI Options (Phase 1.1):
     --allowed-tools TOOLS   Comma-separated list of allowed tools (default: $CLAUDE_ALLOWED_TOOLS)
     --no-continue           Disable session continuity across loops
     --session-expiry HOURS  Set session expiration time in hours (default: $CLAUDE_SESSION_EXPIRY_HOURS)
+
+Plan Queue Mode:
+    --plan-dir DIR          Execute *-PLAN.md files from DIR sequentially.
+                            Skips plans that already have a matching *-SUMMARY.md.
+                            Resumes from where it left off on restart.
+                            Example: ralph --plan-dir .planning/phases
 
 Files created:
     - $LOG_DIR/: All execution logs
@@ -1921,6 +2162,14 @@ while [[ $# -gt 0 ]]; do
         --auto-reset-circuit)
             CB_AUTO_RESET=true
             shift
+            ;;
+        --plan-dir)
+            if [[ -z "$2" || ! -d "$2" ]]; then
+                echo "Error: --plan-dir requires a valid directory path"
+                exit 1
+            fi
+            PLAN_DIR="$2"
+            shift 2
             ;;
         *)
             echo "Unknown option: $1"

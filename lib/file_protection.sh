@@ -19,7 +19,13 @@ RALPH_MISSING_FILES=()
 # Validate that all required Ralph files and directories exist
 # Sets RALPH_MISSING_FILES with the list of missing items
 # Returns: 0 if all required paths exist, 1 if any are missing
+# Note: In plan-dir mode (PLAN_DIR is set), integrity checks are skipped
 validate_ralph_integrity() {
+    # Skip integrity check in plan-dir mode — no .ralph/ project required
+    if [[ -n "${PLAN_DIR:-}" ]]; then
+        return 0
+    fi
+
     local path
     RALPH_MISSING_FILES=()
 
