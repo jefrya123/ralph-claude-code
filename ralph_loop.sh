@@ -810,7 +810,7 @@ get_plan_progress() {
     local total=${#PLAN_QUEUE[@]}
     for plan_file in "${PLAN_QUEUE[@]}"; do
         if is_plan_completed "$plan_file"; then
-            ((completed++))
+            completed=$((completed + 1))
         fi
     done
     echo "$completed/$total"
@@ -825,7 +825,7 @@ update_plan_queue_status() {
 
     for plan_file in "${PLAN_QUEUE[@]}"; do
         if is_plan_completed "$plan_file"; then
-            ((completed++))
+            completed=$((completed + 1))
         fi
     done
 
