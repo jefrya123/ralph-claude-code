@@ -1233,10 +1233,11 @@ build_claude_command() {
 
     # Claude CLI: -p (--print) is a boolean flag meaning "print response and exit".
     # The prompt text goes as a positional argument AFTER all flags.
-    # We must ensure -p comes before the prompt, and the prompt is the last arg.
+    # Use -- to signal end of options so content starting with dashes
+    # (e.g. YAML frontmatter ---) isn't parsed as a CLI flag.
     local prompt_content
     prompt_content=$(cat "$prompt_file")
-    CLAUDE_CMD_ARGS+=("-p" "$prompt_content")
+    CLAUDE_CMD_ARGS+=("-p" "--" "$prompt_content")
 }
 
 # Main execution function
@@ -1365,9 +1366,11 @@ execute_claude_code() {
         # Add streaming-specific flags BEFORE the prompt positional arg
         LIVE_CMD_ARGS+=("--verbose" "--include-partial-messages")
 
-        # Prompt text must be the final positional argument
+        # Prompt text must be the final positional argument.
+        # Use -- to signal end of options so content starting with dashes
+        # (e.g. YAML frontmatter ---) isn't parsed as a CLI flag.
         if [[ -n "$prompt_positional" ]]; then
-            LIVE_CMD_ARGS+=("$prompt_positional")
+            LIVE_CMD_ARGS+=("--" "$prompt_positional")
         fi
 
         # jq filter: show text + tool names + newlines for readability
