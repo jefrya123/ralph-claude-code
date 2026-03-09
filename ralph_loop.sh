@@ -1846,6 +1846,18 @@ main() {
     log_status "SUCCESS" "🚀 Ralph loop starting with Claude Code"
     log_status "INFO" "Max calls per hour: $MAX_CALLS_PER_HOUR"
 
+    # Auto-detect plan directory if --plan-dir not explicitly set
+    if [[ -z "$PLAN_DIR" ]]; then
+        # Check common plan directory locations
+        for candidate in ".planning/phases" ".planning" "plans" "docs/plans"; do
+            if [[ -d "$candidate" ]] && find "$candidate" -name "*-PLAN.md" -type f 2>/dev/null | head -1 | grep -q .; then
+                PLAN_DIR="$candidate"
+                log_status "INFO" "Auto-detected plan directory: $PLAN_DIR"
+                break
+            fi
+        done
+    fi
+
     # ========================================================================
     # Plan Queue Mode: execute plans sequentially from a directory
     # ========================================================================
