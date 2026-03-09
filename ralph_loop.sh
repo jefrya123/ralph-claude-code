@@ -1201,7 +1201,12 @@ build_claude_command() {
     fi
 
     # Add allowed tools (each tool as separate array element)
-    if [[ -n "$CLAUDE_ALLOWED_TOOLS" ]]; then
+    # Special values:
+    #   NONE - don't pass --allowedTools (Claude uses its default permission system)
+    #   SKIP_PERMISSIONS - use --dangerously-skip-permissions (no permission prompts at all)
+    if [[ "$CLAUDE_ALLOWED_TOOLS" == "SKIP_PERMISSIONS" ]]; then
+        CLAUDE_CMD_ARGS+=("--dangerously-skip-permissions")
+    elif [[ -n "$CLAUDE_ALLOWED_TOOLS" && "$CLAUDE_ALLOWED_TOOLS" != "NONE" ]]; then
         CLAUDE_CMD_ARGS+=("--allowedTools")
         # Split by comma and add each tool
         local IFS=','
