@@ -1217,6 +1217,11 @@ build_claude_command() {
     # Array-based approach maintains shell injection safety
     local prompt_content
     prompt_content=$(cat "$prompt_file")
+    # Prevent content starting with dashes from being parsed as CLI flags
+    if [[ "$prompt_content" == -* ]]; then
+        prompt_content="Execute the following plan:
+$prompt_content"
+    fi
     CLAUDE_CMD_ARGS+=("-p" "$prompt_content")
 }
 
