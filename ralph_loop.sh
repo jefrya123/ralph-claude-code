@@ -1339,36 +1339,34 @@ execute_claude_code() {
         # positional argument that MUST be the last element in the command.
         # We extract it, insert streaming flags, then re-append the prompt last.
         local -a LIVE_CMD_ARGS=()
-        local skip_next=false
         local prompt_positional=""
-        local found_print_flag=false
+        local skip_next=false
+        local capture_prompt=false
+        local past_separator=false
         for arg in "${CLAUDE_CMD_ARGS[@]}"; do
             if [[ "$skip_next" == "true" ]]; then
-                # Replace "json" with "stream-json" for output format
                 LIVE_CMD_ARGS+=("stream-json")
                 skip_next=false
+            elif [[ "$past_separator" == "true" ]]; then
+                # Everything after -- is the prompt positional arg
+                prompt_positional="$arg"
+            elif [[ "$arg" == "--" ]]; then
+                # End-of-options marker; next arg is the prompt
+                past_separator=true
             elif [[ "$arg" == "--output-format" ]]; then
                 LIVE_CMD_ARGS+=("$arg")
                 skip_next=true
             elif [[ "$arg" == "-p" ]]; then
-                # -p is a boolean flag (--print), add it as a flag
                 LIVE_CMD_ARGS+=("$arg")
-                found_print_flag=true
-            elif [[ "$found_print_flag" == "true" && -z "$prompt_positional" ]]; then
-                # The arg right after -p is the prompt text (positional arg)
-                # Save it to append last, after all flags
-                prompt_positional="$arg"
             else
                 LIVE_CMD_ARGS+=("$arg")
             fi
         done
 
-        # Add streaming-specific flags BEFORE the prompt positional arg
+        # Add streaming-specific flags BEFORE the prompt
         LIVE_CMD_ARGS+=("--verbose" "--include-partial-messages")
 
-        # Prompt text must be the final positional argument.
-        # Use -- to signal end of options so content starting with dashes
-        # (e.g. YAML frontmatter ---) isn't parsed as a CLI flag.
+        # Append -- and prompt as the final positional argument
         if [[ -n "$prompt_positional" ]]; then
             LIVE_CMD_ARGS+=("--" "$prompt_positional")
         fi
