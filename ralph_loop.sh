@@ -1212,16 +1212,11 @@ build_claude_command() {
         CLAUDE_CMD_ARGS+=("--append-system-prompt" "$loop_context")
     fi
 
-    # Read prompt file content and use -p flag
-    # Note: Claude CLI uses -p for prompts, not --prompt-file (which doesn't exist)
-    # Array-based approach maintains shell injection safety
+    # Claude CLI: -p (--print) is a boolean flag meaning "print response and exit".
+    # The prompt text goes as a positional argument AFTER all flags.
+    # We must ensure -p comes before the prompt, and the prompt is the last arg.
     local prompt_content
     prompt_content=$(cat "$prompt_file")
-    # Prevent content starting with dashes from being parsed as CLI flags
-    if [[ "$prompt_content" == -* ]]; then
-        prompt_content="Execute the following plan:
-$prompt_content"
-    fi
     CLAUDE_CMD_ARGS+=("-p" "$prompt_content")
 }
 
@@ -1319,9 +1314,14 @@ execute_claude_code() {
         echo -e "${PURPLE}━━━━━━━━━━━━━━━━ Claude Code Output ━━━━━━━━━━━━━━━━${NC}"
 
         # Modify CLAUDE_CMD_ARGS: replace --output-format value with stream-json
-        # and add streaming-specific flags
+        # and add streaming-specific flags.
+        # IMPORTANT: Claude CLI's -p is a boolean flag; the prompt text is a
+        # positional argument that MUST be the last element in the command.
+        # We extract it, insert streaming flags, then re-append the prompt last.
         local -a LIVE_CMD_ARGS=()
         local skip_next=false
+        local prompt_positional=""
+        local found_print_flag=false
         for arg in "${CLAUDE_CMD_ARGS[@]}"; do
             if [[ "$skip_next" == "true" ]]; then
                 # Replace "json" with "stream-json" for output format
@@ -1330,14 +1330,26 @@ execute_claude_code() {
             elif [[ "$arg" == "--output-format" ]]; then
                 LIVE_CMD_ARGS+=("$arg")
                 skip_next=true
+            elif [[ "$arg" == "-p" ]]; then
+                # -p is a boolean flag (--print), add it as a flag
+                LIVE_CMD_ARGS+=("$arg")
+                found_print_flag=true
+            elif [[ "$found_print_flag" == "true" && -z "$prompt_positional" ]]; then
+                # The arg right after -p is the prompt text (positional arg)
+                # Save it to append last, after all flags
+                prompt_positional="$arg"
             else
                 LIVE_CMD_ARGS+=("$arg")
             fi
         done
 
-        # Add streaming-specific flags (--verbose and --include-partial-messages)
-        # These are required for stream-json to work properly
+        # Add streaming-specific flags BEFORE the prompt positional arg
         LIVE_CMD_ARGS+=("--verbose" "--include-partial-messages")
+
+        # Prompt text must be the final positional argument
+        if [[ -n "$prompt_positional" ]]; then
+            LIVE_CMD_ARGS+=("$prompt_positional")
+        fi
 
         # jq filter: show text + tool names + newlines for readability
         local jq_filter='
